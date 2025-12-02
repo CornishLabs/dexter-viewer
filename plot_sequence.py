@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
 
 # %% Parse file
-xml_path = "example-sequence-2.xml"
+xml_path = "complicated-example-sequence.xml"
 
 parser = ET.XMLParser(encoding="cp1252")  # try "latin-1" if needed
 tree = ET.parse(xml_path, parser=parser)
@@ -510,82 +510,6 @@ print("Header[0]:", steps[0] if steps else None)
 print("Fast digital value:", int(digital_mats.fast[ch, step]), "| channel:", fast_digital.pairs[ch])
 print("Fast analogue voltage:", analogue_mats.fast_voltage[ch, step], "| ramp?:", int(analogue_mats.fast_ramp[ch, step]), "| channel:", fast_analogue.pairs[ch])
 
-# %% Plot: Fast digital matrix (log-width cells, colored 0/1)
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
-
-print("=== Plot: Fast digital channels matrix ===")
-
-# --- pull data + labels, and align lengths safely ---
-mat = digital_mats.fast  # shape (channels, steps)
-n_ch, n_steps_mat = mat.shape
-n_steps_hdr = len(steps)
-
-n_steps = min(n_steps_mat, n_steps_hdr) if n_steps_hdr else n_steps_mat
-if n_steps_hdr and n_steps_mat != n_steps_hdr:
-    print(f"WARNING: fast digital has {n_steps_mat} steps, headers have {n_steps_hdr}. Plotting first {n_steps}.")
-
-mat_i = mat[:, :n_steps].astype(int)
-y_labels = fast_digital.human_names[:n_ch] if len(fast_digital.human_names) >= n_ch else [str(i) for i in range(n_ch)]
-x_labels = [steps[i].step_name for i in range(n_steps)] if n_steps_hdr else [str(i) for i in range(n_steps)]
-
-# --- compute log-widths from step durations (seconds) ---
-# user example: make 1µs be ~1/6 the width of 1s
-# linear map in log10 space: w = (5/6)*log10(t) + 6
-# so w(1s)=6 and w(1e-6s)=1
-dt_s = np.ones(n_steps, dtype=float)
-if n_steps_hdr:
-    for i in range(n_steps):
-        v = steps[i].dt_seconds
-        dt_s[i] = float(v) if (v is not None and v > 0) else 1e-6  # fallback to 1µs if unknown/invalid
-
-dt_s = np.clip(dt_s, 1e-12, None)
-w = (5.0 / 6.0) * np.log10(dt_s) + 6.0
-# w = np.clip(w, 0.25, None)  # keep every step visible
-
-x_edges = np.concatenate([[0.0], np.cumsum(w)])
-y_edges = np.arange(n_ch + 1, dtype=float)
-
-x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
-y_centers = np.arange(n_ch, dtype=float) + 0.5
-
-print(f"Channels: {n_ch}, Steps: {n_steps}")
-print("Duration range (s):", float(np.min(dt_s)), "→", float(np.max(dt_s)))
-print("Width range (arb.):", float(np.min(w)), "→", float(np.max(w)))
-
-# --- plot ---
-cmap = ListedColormap(["darkred", "lime"])  # 0 -> dark red, 1 -> bright green
-norm = BoundaryNorm([-0.5, 0.5, 1.5], cmap.N)
-
-fig, ax = plt.subplots(figsize=(18, 10), constrained_layout=True)
-
-# pcolormesh supports non-uniform cell widths via custom x_edges
-pm = ax.pcolormesh(
-    x_edges,
-    y_edges,
-    mat_i,
-    cmap=cmap,
-    norm=norm,
-    shading="flat",
-    linewidth=0.05,
-    edgecolors="black",
-)
-
-ax.set_title("Fast digital channels (0=dark red, 1=bright green) with log-width time steps")
-ax.set_xlabel("Step (cell width ~ log10(dt_seconds))")
-ax.set_ylabel("Channel index / name")
-
-# ticks + tiny labels
-ax.set_xticks(x_centers)
-ax.set_xticklabels(x_labels, rotation=90, fontsize=7)
-ax.set_yticks(y_centers)
-ax.set_yticklabels([f"{i:02d} {name}" for i, name in enumerate(y_labels)], fontsize=7)
-
-# optional: put channel 0 at top (often nicer for "matrix" views)
-ax.invert_yaxis()
-
-plt.show()
 # %%
 
 
@@ -689,50 +613,80 @@ def compute_step_widths_log_two_stage(
 
     return widths
 
-# ============================================================
-# Plotting (takes widths as input)
-# ============================================================
+# %%
 
-def plot_fast_digital_grid(
+def _format_seconds_2sf(seconds: float) -> str:
+    """
+    Format seconds into a sensible unit with:
+      - at least one digit before the decimal point
+      - ~2 significant figures (displayed via 2 decimals after scaling)
+    """
+    s = float(seconds)
+    if not np.isfinite(s) or s <= 0:
+        return "?"
+
+    units = [("ns", 1e-9), ("µs", 1e-6), ("ms", 1e-3), ("s", 1.0), ("min", 60.0), ("h", 3600.0)]
+    for name, scale in units:
+        v = s / scale
+        if v >= 1.0 and v < 1000.0:
+            return f"{v:.2f}{name}"
+    # fallback: pick the largest unit and show the value
+    name, scale = units[-1]
+    return f"{(s/scale):.2f}{name}"
+
+def _step_duration_seconds(step) -> float:
+    # you said non-zero/positive, but guard anyway
+    v = getattr(step, "dt_seconds", None)
+    if v is None or not np.isfinite(v) or v <= 0:
+        return 1e-6
+    return float(v)
+
+def _cumulative_step_seconds(steps, n_steps: int) -> np.ndarray:
+    dt = np.array([_step_duration_seconds(steps[i]) for i in range(n_steps)], dtype=float)
+    return np.cumsum(dt)
+
+def plot_fast_digital_grid_robust(
     mat_bool: np.ndarray,            # shape (channels, steps)
     channel_names: list[str],        # y labels, length channels
     steps,                           # list[StepHeader] (for labels + events)
-    step_widths: np.ndarray,         # length n_steps_to_plot
+    step_widths: np.ndarray,         # arbitrary widths (for x-geometry), length n_steps_to_plot
     label_fontsize: int = 7,
 ):
     print("=== Plot: Fast digital channels matrix ===")
 
     n_ch, n_steps_mat = mat_bool.shape
     n_steps_hdr = len(steps) if steps is not None else 0
-
     n_steps = min(n_steps_mat, n_steps_hdr, len(step_widths)) if n_steps_hdr else min(n_steps_mat, len(step_widths))
     if n_steps <= 0:
         raise ValueError("No steps available to plot (check matrix / headers / widths).")
-
     if n_steps_hdr and n_steps_mat != n_steps_hdr:
         print(f"WARNING: matrix has {n_steps_mat} steps, headers have {n_steps_hdr}. Plotting first {n_steps}.")
-    if len(step_widths) != n_steps:
-        step_widths = np.asarray(step_widths, dtype=float)[:n_steps]
 
-    # data as 0/1 ints for colormap boundary norm
-    mat_i = mat_bool[:, :n_steps].astype(int)
-
-    # labels
-    y_labels = channel_names[:n_ch] if len(channel_names) >= n_ch else [str(i) for i in range(n_ch)]
-    x_step_labels = [steps[i].step_name for i in range(n_steps)] if n_steps_hdr else [str(i) for i in range(n_steps)]
-
-    # edges/centers from precomputed widths
-    w = np.asarray(step_widths, dtype=float)
+    w = np.asarray(step_widths, dtype=float)[:n_steps]
     if np.any(w <= 0):
         raise ValueError("All step widths must be positive.")
+
+    # data + labels
+    mat_i = mat_bool[:, :n_steps].astype(int)
+    y_labels = channel_names[:n_ch] if len(channel_names) >= n_ch else [str(i) for i in range(n_ch)]
+
+    # time strings
+    dt_s = np.array([_step_duration_seconds(steps[i]) for i in range(n_steps)], dtype=float) if n_steps_hdr else np.ones(n_steps)
+    cum_s = _cumulative_step_seconds(steps, n_steps) if n_steps_hdr else np.arange(1, n_steps + 1, dtype=float)
+
+    x_step_labels = []
+    for i in range(n_steps):
+        step_name = steps[i].step_name if n_steps_hdr else str(i)
+        x_step_labels.append(f"{step_name} ({_format_seconds_2sf(dt_s[i])})")
+
+    # geometry
     x_edges = np.concatenate([[0.0], np.cumsum(w)])
     y_edges = np.arange(n_ch + 1, dtype=float)
-
     x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
     y_centers = np.arange(n_ch, dtype=float) + 0.5
 
     # colors
-    cmap = ListedColormap(["darkred", "lime"])  # 0 -> dark red, 1 -> bright green
+    cmap = ListedColormap(["darkred", "lime"])
     norm = BoundaryNorm([-0.5, 0.5, 1.5], cmap.N)
 
     fig, ax = plt.subplots(figsize=(18, 10), constrained_layout=True)
@@ -744,7 +698,6 @@ def plot_fast_digital_grid(
         edgecolors="black",
     )
 
-    # ax.set_title(title)
     ax.set_xlabel("Steps (cell widths provided externally)")
     ax.set_ylabel("Channel index / name")
 
@@ -754,66 +707,175 @@ def plot_fast_digital_grid(
     ax.set_yticklabels([f"{i:02d} {name}" for i, name in enumerate(y_labels)], fontsize=label_fontsize)
     ax.invert_yaxis()
 
-    # --- event braces + vertical event labels on top ---
+    # --- robust event braces + labels on SAME axis (no twiny) ---
     if n_steps_hdr:
         spans = compute_event_spans(steps, n_steps)
-        ax_top = ax.twiny()
-        ax_top.set_xlim(ax.get_xlim())
-        ax_top.set_xticks([])  # we draw our own labels/braces
-        # ax_top.set_xlabel("Events")
-
-        y0 = 1.00
+        y0 = 1.01
         h = 0.03
         for (s, e, ev_name) in spans:
             x0, x1 = float(x_edges[s]), float(x_edges[e])
-            # brace
-            ax_top.plot(
+            # cumulative time at end of event:
+            t_end = float(cum_s[e - 1]) if e > 0 else 0.0
+            ev_label = f"{ev_name} ({_format_seconds_2sf(t_end)})"
+
+            ax.plot(
                 [x0, x0, x1, x1],
                 [y0, y0 + h, y0 + h, y0],
-                transform=ax_top.get_xaxis_transform(),
+                transform=ax.get_xaxis_transform(),  # x=data, y=axes fraction
                 color="black",
                 lw=0.8,
                 clip_on=False,
             )
-            # vertical label
-            ax_top.text(
-                0.5 * (x0 + x1), y0 + h + 0.01, ev_name,
-                transform=ax_top.get_xaxis_transform(),
+            ax.text(
+                0.5 * (x0 + x1), y0 + h + 0.005, ev_label,
+                transform=ax.get_xaxis_transform(),
                 ha="left", va="bottom",
                 fontsize=label_fontsize,
-                rotation=90, rotation_mode="anchor",
+                rotation=90,
+                rotation_mode="anchor",
                 clip_on=False,
             )
 
     plt.show()
     return fig, ax
 
-# ============================================================
-# Example usage (choose a width mode)
-# ============================================================
-
-# Align lengths (matrix vs headers) for width computation
+# --- run plot ---
 n_steps_for_widths = min(digital_mats.fast.shape[1], len(steps))
-
-# Mode 1: constant widths
-# widths = compute_step_widths_constant(n_steps_for_widths, width=1.0)
-
-# Mode 2: one-stage log (bounded by max_ratio)
-# dt = _safe_dt_seconds(steps, n_steps_for_widths)
-# widths = compute_step_widths_log_one_stage(dt, max_ratio=8.0, min_width=1.0)
-
-# Mode 3: two-stage log (bounded overall by max_total_ratio)
 widths = compute_step_widths_log_two_stage(steps, n_steps_for_widths, max_total_ratio=20.0, min_width=0.1)
 
-# Plot using externally computed widths
-plot_fast_digital_grid(
+plot_fast_digital_grid_robust(
     mat_bool=digital_mats.fast,
     channel_names=fast_digital.human_names,
     steps=steps,
     step_widths=widths,
     label_fontsize=7,
 )
+# %%
+# ============================================================
+# Plot: Fast analogue voltages (robust event braces on same axis)
+# ============================================================
 
+import numpy as np
+import matplotlib.pyplot as plt
+
+print("=== Plot: Fast analogue voltages (piecewise constant/linear with ramp) ===")
+
+# --- pull data + labels, and align lengths safely ---
+V = analogue_mats.fast_voltage            # shape (channels, steps)
+R = analogue_mats.fast_ramp.astype(bool)  # shape (channels, steps)
+n_ch, n_steps_mat = V.shape
+n_steps_hdr = len(steps) if steps is not None else 0
+
+n_steps = min(n_steps_mat, n_steps_hdr, len(widths)) if n_steps_hdr else min(n_steps_mat, len(widths))
+if n_steps_hdr and n_steps_mat != n_steps_hdr:
+    print(f"WARNING: fast analogue has {n_steps_mat} steps, headers have {n_steps_hdr}. Plotting first {n_steps}.")
+
+widths_plot = np.asarray(widths, dtype=float)[:n_steps]
+if np.any(widths_plot <= 0):
+    raise ValueError("All step widths must be positive.")
+
+V = V[:, :n_steps]
+R = R[:, :n_steps]
+
+y_labels = fast_analogue.human_names[:n_ch] if len(fast_analogue.human_names) >= n_ch else [str(i) for i in range(n_ch)]
+
+dt_s = np.array([_step_duration_seconds(steps[i]) for i in range(n_steps)], dtype=float) if n_steps_hdr else np.ones(n_steps)
+cum_s = _cumulative_step_seconds(steps, n_steps) if n_steps_hdr else np.arange(1, n_steps + 1, dtype=float)
+
+x_step_labels = []
+for i in range(n_steps):
+    step_name = steps[i].step_name if n_steps_hdr else str(i)
+    x_step_labels.append(f"{step_name} ({_format_seconds_2sf(dt_s[i])})")
+
+# --- x coordinates from widths ---
+x_edges = np.concatenate([[0.0], np.cumsum(widths_plot)])
+x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+
+print(f"Channels: {n_ch}, Steps: {n_steps}")
+print("Width range (arb.):", float(np.min(widths_plot)), "→", float(np.max(widths_plot)))
+
+# --- stacked y mapping (each trace lives in its own horizontal band) ---
+V_min = float(np.nanmin(V))
+V_max = float(np.nanmax(V))
+V_span = max(V_max - V_min, 1e-12)
+
+band_height = 0.9
+band_offset = 0.05
+volts_to_band = band_height / V_span
+
+def y_of(ch: int, v: float) -> float:
+    return ch + band_offset + (v - V_min) * volts_to_band
+
+fig, ax = plt.subplots(figsize=(18, 10), constrained_layout=True)
+
+# very light segment boundaries at every step end
+for xe in x_edges[1:]:
+    ax.axvline(xe, color="0.7", alpha=0.2, linewidth=0.6, zorder=0)
+
+# draw each channel trace
+for ch in range(n_ch):
+    xs, ys = [], []
+    for i in range(n_steps):
+        x0 = float(x_edges[i])
+        x1 = float(x_edges[i + 1])
+
+        v0 = float(V[ch, i])
+        if bool(R[ch, i]) and i < n_steps - 1:
+            v1 = float(V[ch, i + 1])
+        else:
+            v1 = v0
+
+        xs.extend([x0, x1, np.nan])
+        ys.extend([y_of(ch, v0), y_of(ch, v1), np.nan])
+
+    ax.plot(xs, ys, linewidth=1.0)
+
+ax.set_xlabel("Step (cell width from supplied widths)")
+ax.set_ylabel("Channel index / name (stacked)")
+
+ax.set_yticks(np.arange(n_ch) + 0.5)
+ax.set_yticklabels([f"{i:02d} {name}" for i, name in enumerate(y_labels)], fontsize=7)
+
+ax.set_xticks(x_centers)
+ax.set_xticklabels(x_step_labels, rotation=90, fontsize=7)
+
+# subtle horizontal separators between channels
+for ch in range(n_ch + 1):
+    ax.axhline(ch, linewidth=0.3, alpha=0.3, zorder=0)
+
+# limits: start exactly at the first segment start; end at last segment end
+ax.set_xlim(float(x_edges[0]), float(x_edges[-1]))
+ax.set_ylim(float(n_ch), 0.0)
+
+# --- robust event braces + labels on SAME axis (no twiny) ---
+if n_steps_hdr:
+    spans = compute_event_spans(steps, n_steps)
+    y0 = 1.01
+    h = 0.03
+    for (s, e, ev_name) in spans:
+        x0, x1 = float(x_edges[s]), float(x_edges[e])
+        t_end = float(cum_s[e - 1]) if e > 0 else 0.0
+        ev_label = f"{ev_name} ({_format_seconds_2sf(t_end)})"
+
+        ax.plot(
+            [x0, x0, x1, x1],
+            [y0, y0 + h, y0 + h, y0],
+            transform=ax.get_xaxis_transform(),
+            color="black",
+            lw=0.8,
+            clip_on=False,
+        )
+        ax.text(
+            0.5 * (x0 + x1), y0 + h + 0.005, ev_label,
+            transform=ax.get_xaxis_transform(),
+            ha="left", va="bottom",
+            fontsize=7,
+            rotation=90,
+            rotation_mode="anchor",
+            clip_on=False,
+        )
+
+plt.show()
 
 # %%
 #########
