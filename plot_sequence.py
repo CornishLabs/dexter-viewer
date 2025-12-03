@@ -6,11 +6,14 @@ from typing import Optional
 
 import numpy as np
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
+import matplotlib.ticker as mticker
 
+plt.close('all')
 # %% Parse file
-xml_path = "complicated-example-sequence.xml"
+xml_path = "example-sequence.xml"
 
 parser = ET.XMLParser(encoding="cp1252")  # try "latin-1" if needed
 tree = ET.parse(xml_path, parser=parser)
@@ -641,87 +644,159 @@ def _step_duration_seconds(step) -> float:
         return 1e-6
     return float(v)
 
-def _cumulative_step_seconds(steps, n_steps: int) -> np.ndarray:
-    dt = np.array([_step_duration_seconds(steps[i]) for i in range(n_steps)], dtype=float)
-    return np.cumsum(dt)
+# %%
 
-def plot_fast_digital_grid_robust(
-    mat_bool: np.ndarray,            # shape (channels, steps)
-    channel_names: list[str],        # y labels, length channels
-    steps,                           # list[StepHeader] (for labels + events)
-    step_widths: np.ndarray,         # arbitrary widths (for x-geometry), length n_steps_to_plot
+def plot_fast_and_slow_digital_grid_robust(
+    fast_mat_bool: np.ndarray,            # (fast_channels, steps)
+    slow_mat_bool: np.ndarray,            # (slow_channels, steps)
+    fast_channels: ChannelSet,            # provides .hardware_ids / .human_names
+    slow_channels: ChannelSet,
+    steps,                                # list[StepHeader]
+    step_widths: np.ndarray,
+    *,
+    fast_channel_indices: Optional[list[int]] = None,  # None => all fast channels
+    slow_channel_indices: Optional[list[int]] = None,  # None => all slow channels
     label_fontsize: int = 7,
+    fast_off: str = "darkred",
+    fast_on: str = "lime",
+    slow_off: str = "#5A0000",            # slightly different dark red
+    slow_on: str = "greenyellow",         # more greeny-yellow than lime
 ):
-    print("=== Plot: Fast digital channels matrix ===")
+    """
+    Stacks fast+slow digital matrices into one grid by encoding 4 states:
+      fast: 0(off),1(on)   slow: 2(off),3(on)
 
-    n_ch, n_steps_mat = mat_bool.shape
+    Channel selection:
+      - pass None to plot all channels
+      - or pass indices like list(range(17)) to plot only 0..16
+
+    Y-axis labels: "{Hardware ID}: {Human Name}"
+    """
+    print("=== Plot: Fast+Slow digital channels matrix (stacked) ===")
+
+    def _norm_indices(idxs: Optional[list[int]], n: int, label: str) -> np.ndarray:
+        if idxs is None:
+            return np.arange(n, dtype=int)
+        idxs_arr = np.asarray(list(idxs), dtype=int)
+        if idxs_arr.size == 0:
+            raise ValueError(f"{label}: empty index list.")
+        if np.any(idxs_arr < 0) or np.any(idxs_arr >= n):
+            bad = idxs_arr[(idxs_arr < 0) | (idxs_arr >= n)]
+            raise IndexError(f"{label}: indices out of range 0..{n-1}: {bad.tolist()}")
+        _, first_pos = np.unique(idxs_arr, return_index=True)
+        return idxs_arr[np.sort(first_pos)]
+
+    # ----------------------------
+    # step alignment
+    # ----------------------------
+    n_fast, n_steps_fast = fast_mat_bool.shape
+    n_slow, n_steps_slow = slow_mat_bool.shape
     n_steps_hdr = len(steps) if steps is not None else 0
-    n_steps = min(n_steps_mat, n_steps_hdr, len(step_widths)) if n_steps_hdr else min(n_steps_mat, len(step_widths))
+
+    n_steps = min(n_steps_fast, n_steps_slow, len(step_widths))
+    if n_steps_hdr:
+        n_steps = min(n_steps, n_steps_hdr)
     if n_steps <= 0:
-        raise ValueError("No steps available to plot (check matrix / headers / widths).")
-    if n_steps_hdr and n_steps_mat != n_steps_hdr:
-        print(f"WARNING: matrix has {n_steps_mat} steps, headers have {n_steps_hdr}. Plotting first {n_steps}.")
+        raise ValueError("No steps available to plot (check matrices / headers / widths).")
 
     w = np.asarray(step_widths, dtype=float)[:n_steps]
     if np.any(w <= 0):
         raise ValueError("All step widths must be positive.")
 
-    # data + labels
-    mat_i = mat_bool[:, :n_steps].astype(int)
-    y_labels = channel_names[:n_ch] if len(channel_names) >= n_ch else [str(i) for i in range(n_ch)]
+    # ----------------------------
+    # channel selection
+    # ----------------------------
+    fast_sel = _norm_indices(fast_channel_indices, n_fast, "fast_channel_indices")
+    slow_sel = _norm_indices(slow_channel_indices, n_slow, "slow_channel_indices")
 
-    # time strings
+    fast_i = fast_mat_bool[fast_sel, :n_steps].astype(np.uint8)
+    slow_i = slow_mat_bool[slow_sel, :n_steps].astype(np.uint8) + 2
+    mat4 = np.vstack([fast_i, slow_i]).astype(int)
+
+    n_fast_plot = fast_sel.size
+    n_slow_plot = slow_sel.size
+    n_total = n_fast_plot + n_slow_plot
+
+    # ----------------------------
+    # labels (hardware + human)
+    # ----------------------------
+    def _safe_get(lst: list[str], i: int, fallback: str) -> str:
+        return lst[i] if i < len(lst) and lst[i] else fallback
+
+    fast_hw = fast_channels.hardware_ids
+    fast_hn = fast_channels.human_names
+    slow_hw = slow_channels.hardware_ids
+    slow_hn = slow_channels.human_names
+
+    y_labels: list[str] = []
+    for i in fast_sel:
+        hw = _safe_get(fast_hw, int(i), f"FDO {int(i)}")
+        hn = _safe_get(fast_hn, int(i), "")
+        y_labels.append(f"{hw}: {hn}" if hn else hw)
+    for i in slow_sel:
+        hw = _safe_get(slow_hw, int(i), f"SDO {int(i)}")
+        hn = _safe_get(slow_hn, int(i), "")
+        y_labels.append(f"{hw}: {hn}" if hn else hw)
+
     dt_s = np.array([_step_duration_seconds(steps[i]) for i in range(n_steps)], dtype=float) if n_steps_hdr else np.ones(n_steps)
-    cum_s = _cumulative_step_seconds(steps, n_steps) if n_steps_hdr else np.arange(1, n_steps + 1, dtype=float)
-
     x_step_labels = []
     for i in range(n_steps):
         step_name = steps[i].step_name if n_steps_hdr else str(i)
         x_step_labels.append(f"{step_name} ({_format_seconds_2sf(dt_s[i])})")
 
+    # ----------------------------
     # geometry
+    # ----------------------------
     x_edges = np.concatenate([[0.0], np.cumsum(w)])
-    y_edges = np.arange(n_ch + 1, dtype=float)
+    y_edges = np.arange(n_total + 1, dtype=float)
     x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
-    y_centers = np.arange(n_ch, dtype=float) + 0.5
+    y_centers = np.arange(n_total, dtype=float) + 0.5
 
-    # colors
-    cmap = ListedColormap(["darkred", "lime"])
-    norm = BoundaryNorm([-0.5, 0.5, 1.5], cmap.N)
+    # ----------------------------
+    # colors: 4 bins (fast off/on, slow off/on)
+    # ----------------------------
+    cmap = ListedColormap([fast_off, fast_on, slow_off, slow_on])
+    norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap.N)
 
-    fig, ax = plt.subplots(figsize=(18, 10), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(19, 10.5), constrained_layout=True)
+    edge_rgba = (0.2, 0.2, 0.2, 0.08)
+
     ax.pcolormesh(
-        x_edges, y_edges, mat_i,
+        x_edges, y_edges, mat4,
         cmap=cmap, norm=norm,
         shading="flat",
-        linewidth=0.05,
-        edgecolors="black",
+        edgecolors=edge_rgba, linewidth=0.05, antialiased=False,
     )
 
     ax.set_xlabel("Steps (cell widths provided externally)")
-    ax.set_ylabel("Channel index / name")
+    ax.set_ylabel("Digital channel (hardware: human)")
 
     ax.set_xticks(x_centers)
     ax.set_xticklabels(x_step_labels, rotation=90, fontsize=label_fontsize)
     ax.set_yticks(y_centers)
-    ax.set_yticklabels([f"{i:02d} {name}" for i, name in enumerate(y_labels)], fontsize=label_fontsize)
+    ax.set_yticklabels(y_labels, fontsize=label_fontsize)
     ax.invert_yaxis()
 
-    # --- robust event braces + labels on SAME axis (no twiny) ---
+    # separator line between fast and slow blocks (only if both plotted)
+    if n_fast_plot > 0 and n_slow_plot > 0:
+        ax.axhline(n_fast_plot, color="black", linewidth=1.0, alpha=0.6)
+
+    # ----------------------------
+    # robust event braces + labels on SAME axis (no twiny)
+    # ----------------------------
     if n_steps_hdr:
         spans = compute_event_spans(steps, n_steps)
         y0 = 1.01
         h = 0.03
         for (s, e, ev_name) in spans:
             x0, x1 = float(x_edges[s]), float(x_edges[e])
-            # cumulative time at end of event:
-            t_end = float(cum_s[e - 1]) if e > 0 else 0.0
-            ev_label = f"{ev_name} ({_format_seconds_2sf(t_end)})"
+            ev_dur = float(np.sum(dt_s[s:e]))
+            ev_label = f"{ev_name} ({_format_seconds_2sf(ev_dur)})"
 
             ax.plot(
                 [x0, x0, x1, x1],
                 [y0, y0 + h, y0 + h, y0],
-                transform=ax.get_xaxis_transform(),  # x=data, y=axes fraction
+                transform=ax.get_xaxis_transform(),
                 color="black",
                 lw=0.8,
                 clip_on=False,
@@ -739,143 +814,294 @@ def plot_fast_digital_grid_robust(
     plt.show()
     return fig, ax
 
-# --- run plot ---
-n_steps_for_widths = min(digital_mats.fast.shape[1], len(steps))
+
+# ---- example usage ----
+n_steps_for_widths = min(digital_mats.fast.shape[1], digital_mats.slow.shape[1], len(steps))
 widths = compute_step_widths_log_two_stage(steps, n_steps_for_widths, max_total_ratio=20.0, min_width=0.1)
 
-plot_fast_digital_grid_robust(
-    mat_bool=digital_mats.fast,
-    channel_names=fast_digital.human_names,
+plot_fast_and_slow_digital_grid_robust(
+    fast_mat_bool=digital_mats.fast,
+    slow_mat_bool=digital_mats.slow,
+    fast_channels=fast_digital,
+    slow_channels=slow_digital,
     steps=steps,
     step_widths=widths,
+    fast_channel_indices=None,
+    slow_channel_indices=list(range(16)),
     label_fontsize=7,
+    fast_off="darkred",
+    fast_on="lime",
+    slow_off="#5A0000",
+    slow_on="greenyellow",
 )
+
 # %%
-# ============================================================
-# Plot: Fast analogue voltages (robust event braces on same axis)
-# ============================================================
 
-import numpy as np
-import matplotlib.pyplot as plt
 
-print("=== Plot: Fast analogue voltages (piecewise constant/linear with ramp) ===")
+print("=== Plot: Fast + Slow analogue voltages (stacked subplots, ramp-aware) ===")
 
-# --- pull data + labels, and align lengths safely ---
-V = analogue_mats.fast_voltage            # shape (channels, steps)
-R = analogue_mats.fast_ramp.astype(bool)  # shape (channels, steps)
-n_ch, n_steps_mat = V.shape
-n_steps_hdr = len(steps) if steps is not None else 0
+def plot_fast_and_slow_analogue_stacked(
+    *,
+    V_fast_all: np.ndarray,
+    R_fast_all: np.ndarray,
+    channels_fast: ChannelSet,
+    V_slow_all: np.ndarray,
+    R_slow_all: np.ndarray,
+    channels_slow: ChannelSet,
+    steps,
+    step_widths: np.ndarray,
+    fast_channel_indices: Optional[list[int]] = None,   # None => all
+    slow_channel_indices: Optional[list[int]] = None,   # e.g. list(range(17))
+    slow_facecolor: str = "0.96",
+    label_fontsize: int = 7,
+    line_width: float = 1.5,
+):
+    def _norm_indices(idxs: Optional[list[int]], n: int, label: str) -> np.ndarray:
+        if idxs is None:
+            return np.arange(n, dtype=int)
+        idxs_arr = np.asarray(list(idxs), dtype=int)
+        if idxs_arr.size == 0:
+            raise ValueError(f"{label}: empty index list.")
+        if np.any(idxs_arr < 0) or np.any(idxs_arr >= n):
+            bad = idxs_arr[(idxs_arr < 0) | (idxs_arr >= n)]
+            raise IndexError(f"{label}: indices out of range 0..{n-1}: {bad.tolist()}")
+        # unique, preserve order
+        _, first_pos = np.unique(idxs_arr, return_index=True)
+        return idxs_arr[np.sort(first_pos)]
 
-n_steps = min(n_steps_mat, n_steps_hdr, len(widths)) if n_steps_hdr else min(n_steps_mat, len(widths))
-if n_steps_hdr and n_steps_mat != n_steps_hdr:
-    print(f"WARNING: fast analogue has {n_steps_mat} steps, headers have {n_steps_hdr}. Plotting first {n_steps}.")
+    def _floor_2dp(x: float) -> float:
+        return float(np.floor(x * 100.0) / 100.0)
 
-widths_plot = np.asarray(widths, dtype=float)[:n_steps]
-if np.any(widths_plot <= 0):
-    raise ValueError("All step widths must be positive.")
+    def _ceil_2dp(x: float) -> float:
+        return float(np.ceil(x * 100.0) / 100.0)
 
-V = V[:, :n_steps]
-R = R[:, :n_steps]
+    def _padded_limits(vmin: float, vmax: float, pad_frac: float = 0.10) -> tuple[float, float]:
+        if not (np.isfinite(vmin) and np.isfinite(vmax)):
+            return (-1.0, 1.0)
+        span = float(vmax - vmin)
+        if np.isclose(span, 0.0):
+            pad = max(1e-3, 0.10 * (abs(vmax) if vmax != 0 else 1.0))
+            return (vmin - pad, vmax + pad)
+        pad = pad_frac * abs(span)
+        return (vmin - pad, vmax + pad)
 
-y_labels = fast_analogue.human_names[:n_ch] if len(fast_analogue.human_names) >= n_ch else [str(i) for i in range(n_ch)]
+    # ----------------------------
+    # Align steps + build x-geometry
+    # ----------------------------
+    n_steps_mat = min(V_fast_all.shape[1], V_slow_all.shape[1])
+    n_steps_hdr = len(steps) if steps is not None else 0
+    n_steps = min(n_steps_mat, len(step_widths))
+    if n_steps_hdr:
+        n_steps = min(n_steps, n_steps_hdr)
+    if n_steps <= 0:
+        raise ValueError("No steps available to plot.")
 
-dt_s = np.array([_step_duration_seconds(steps[i]) for i in range(n_steps)], dtype=float) if n_steps_hdr else np.ones(n_steps)
-cum_s = _cumulative_step_seconds(steps, n_steps) if n_steps_hdr else np.arange(1, n_steps + 1, dtype=float)
+    w = np.asarray(step_widths, dtype=float)[:n_steps]
+    if np.any(w <= 0):
+        raise ValueError("All step widths must be positive.")
 
-x_step_labels = []
-for i in range(n_steps):
-    step_name = steps[i].step_name if n_steps_hdr else str(i)
-    x_step_labels.append(f"{step_name} ({_format_seconds_2sf(dt_s[i])})")
+    x_edges = np.concatenate([[0.0], np.cumsum(w)])
+    x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+    segment_xs = x_edges[1:]
 
-# --- x coordinates from widths ---
-x_edges = np.concatenate([[0.0], np.cumsum(widths_plot)])
-x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+    # x tick labels: step name + duration in brackets
+    if n_steps_hdr:
+        dt_s = np.array([_step_duration_seconds(steps[i]) for i in range(n_steps)], dtype=float)
+        x_step_labels = [f"{steps[i].step_name} ({_format_seconds_2sf(dt_s[i])})" for i in range(n_steps)]
+    else:
+        dt_s = np.ones(n_steps, dtype=float)
+        x_step_labels = [str(i) for i in range(n_steps)]
 
-print(f"Channels: {n_ch}, Steps: {n_steps}")
-print("Width range (arb.):", float(np.min(widths_plot)), "→", float(np.max(widths_plot)))
+    # ----------------------------
+    # Channel selection + data slicing
+    # ----------------------------
+    fast_sel = _norm_indices(fast_channel_indices, V_fast_all.shape[0], "fast_channel_indices")
+    slow_sel = _norm_indices(slow_channel_indices, V_slow_all.shape[0], "slow_channel_indices")
 
-# --- stacked y mapping (each trace lives in its own horizontal band) ---
-V_min = float(np.nanmin(V))
-V_max = float(np.nanmax(V))
-V_span = max(V_max - V_min, 1e-12)
+    V_fast = V_fast_all[fast_sel, :n_steps]
+    R_fast = np.asarray(R_fast_all[fast_sel, :n_steps]).astype(bool)
 
-band_height = 0.9
-band_offset = 0.05
-volts_to_band = band_height / V_span
+    V_slow = V_slow_all[slow_sel, :n_steps]
+    R_slow = np.asarray(R_slow_all[slow_sel, :n_steps]).astype(bool)
 
-def y_of(ch: int, v: float) -> float:
-    return ch + band_offset + (v - V_min) * volts_to_band
+    n_fast = fast_sel.size
+    n_slow = slow_sel.size
+    n_axes = n_fast + n_slow
+    if n_axes == 0:
+        raise ValueError("No channels selected to plot (fast+slow).")
 
-fig, ax = plt.subplots(figsize=(18, 10), constrained_layout=True)
+    # Labels "{HW}: {Human}"
+    def _label_for(chset: ChannelSet, idx: int, fallback_prefix: str) -> str:
+        hw = chset.hardware_ids[idx] if idx < len(chset.hardware_ids) and chset.hardware_ids[idx] else f"{fallback_prefix} {idx}"
+        hn = chset.human_names[idx] if idx < len(chset.human_names) and chset.human_names[idx] else ""
+        return f"{hw}: {hn}" if hn else hw
 
-# very light segment boundaries at every step end
-for xe in x_edges[1:]:
-    ax.axvline(xe, color="0.7", alpha=0.2, linewidth=0.6, zorder=0)
+    fast_labels = [_label_for(channels_fast, int(i), "FAO") for i in fast_sel]
+    slow_labels = [_label_for(channels_slow, int(i), "SAO") for i in slow_sel]
 
-# draw each channel trace
-for ch in range(n_ch):
-    xs, ys = [], []
-    for i in range(n_steps):
-        x0 = float(x_edges[i])
-        x1 = float(x_edges[i + 1])
+    # Colors: distinct per channel (fast and slow use different palettes)
+    fast_cmap = mpl.cm.get_cmap("tab10", max(n_fast, 10))
+    slow_cmap = mpl.cm.get_cmap("tab20", max(n_slow, 20))
+    fast_colors = [fast_cmap(i % fast_cmap.N) for i in range(n_fast)]
+    slow_colors = [slow_cmap(i % slow_cmap.N) for i in range(n_slow)]
 
-        v0 = float(V[ch, i])
-        if bool(R[ch, i]) and i < n_steps - 1:
-            v1 = float(V[ch, i + 1])
-        else:
-            v1 = v0
+    # ----------------------------
+    # Figure + axes
+    # ----------------------------
+    fig_h = max(7.0, 0.7 * n_axes)
+    fig, axs = plt.subplots(
+        n_axes, 1,
+        sharex=True,
+        figsize=(19, fig_h),
+        constrained_layout=True,
+    )
+    if n_axes == 1:
+        axs = [axs]
 
-        xs.extend([x0, x1, np.nan])
-        ys.extend([y_of(ch, v0), y_of(ch, v1), np.nan])
+    fig.set_constrained_layout_pads(w_pad=2/72, h_pad=0.5/72, wspace=0.02, hspace=0.0)
 
-    ax.plot(xs, ys, linewidth=1.0)
+    # Helper to plot one channel onto one axis
+    def _plot_channel(ax, Vrow: np.ndarray, Rrow: np.ndarray, color, left_label: str, facecolor: Optional[str]):
+        if facecolor is not None:
+            ax.set_facecolor(facecolor)
 
-ax.set_xlabel("Step (cell width from supplied widths)")
-ax.set_ylabel("Channel index / name (stacked)")
+        # segment dividers
+        for xe in segment_xs:
+            ax.axvline(xe, color="0.7", alpha=0.2, linewidth=0.6, zorder=0)
 
-ax.set_yticks(np.arange(n_ch) + 0.5)
-ax.set_yticklabels([f"{i:02d} {name}" for i, name in enumerate(y_labels)], fontsize=7)
+        # ramp-aware piecewise trace
+        xs, ys = [], []
+        for i in range(n_steps):
+            x0 = float(x_edges[i])
+            x1 = float(x_edges[i + 1])
+            v0 = float(Vrow[i])
+            v1 = float(Vrow[i + 1]) if (bool(Rrow[i]) and i < n_steps - 1) else v0
+            xs.extend([x0, x1, np.nan])
+            ys.extend([v0, v1, np.nan])
 
-ax.set_xticks(x_centers)
-ax.set_xticklabels(x_step_labels, rotation=90, fontsize=7)
+        ax.plot(xs, ys, linewidth=line_width, color=color)
 
-# subtle horizontal separators between channels
-for ch in range(n_ch + 1):
-    ax.axhline(ch, linewidth=0.3, alpha=0.3, zorder=0)
-
-# limits: start exactly at the first segment start; end at last segment end
-ax.set_xlim(float(x_edges[0]), float(x_edges[-1]))
-ax.set_ylim(float(n_ch), 0.0)
-
-# --- robust event braces + labels on SAME axis (no twiny) ---
-if n_steps_hdr:
-    spans = compute_event_spans(steps, n_steps)
-    y0 = 1.01
-    h = 0.03
-    for (s, e, ev_name) in spans:
-        x0, x1 = float(x_edges[s]), float(x_edges[e])
-        t_end = float(cum_s[e - 1]) if e > 0 else 0.0
-        ev_label = f"{ev_name} ({_format_seconds_2sf(t_end)})"
-
-        ax.plot(
-            [x0, x0, x1, x1],
-            [y0, y0 + h, y0 + h, y0],
-            transform=ax.get_xaxis_transform(),
-            color="black",
-            lw=0.8,
-            clip_on=False,
-        )
+        # left label
         ax.text(
-            0.5 * (x0 + x1), y0 + h + 0.005, ev_label,
-            transform=ax.get_xaxis_transform(),
-            ha="left", va="bottom",
-            fontsize=7,
-            rotation=90,
-            rotation_mode="anchor",
+            -0.02, 0.5, left_label,
+            transform=ax.transAxes,
+            ha="right", va="center",
+            fontsize=label_fontsize,
             clip_on=False,
         )
 
-plt.show()
+        # right ticks: min/max floored/ceiled (2dp), but keep Qt readout happy:
+        vmin = float(np.nanmin(Vrow))
+        vmax = float(np.nanmax(Vrow))
+        y0t = _floor_2dp(vmin)
+        y1t = _ceil_2dp(vmax)
+        if np.isclose(y0t, y1t):
+            delta = max(0.01, 0.10 * (abs(y0t) if y0t != 0 else 1.0))
+            y0t, y1t = y0t - delta, y1t + delta
+
+        ax.yaxis.set_ticks_position("right")
+        ax.tick_params(axis="y", left=False, right=True, labelsize=label_fontsize)
+        ax.set_yticks([y0t, y1t])
+        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))  # <-- no set_yticklabels()
+
+        # padded y-lims
+        y0, y1 = _padded_limits(vmin, vmax, pad_frac=0.10)
+        ax.set_ylim(y0, y1)
+
+        # keep spines visible (top/bottom lines separate channels)
+        for side in ("top", "bottom", "left", "right"):
+            ax.spines[side].set_visible(True)
+            ax.spines[side].set_linewidth(0.8)
+
+        ax.tick_params(axis="y", which="both", left=False)
+
+    # Plot FAST first (top)
+    for r in range(n_fast):
+        _plot_channel(
+            axs[r],
+            V_fast[r, :],
+            R_fast[r, :],
+            fast_colors[r],
+            fast_labels[r],
+            facecolor=None,
+        )
+
+    # Plot SLOW underneath (slightly greyer axes background)
+    for r in range(n_slow):
+        _plot_channel(
+            axs[n_fast + r],
+            V_slow[r, :],
+            R_slow[r, :],
+            slow_colors[r],
+            slow_labels[r],
+            facecolor=slow_facecolor,
+        )
+
+    # X ticks only on the bottom-most axis
+    for ax in axs[:-1]:
+        ax.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+
+    axs[-1].set_xticks(x_centers)
+    axs[-1].set_xticklabels(
+        x_step_labels,
+        rotation=45,
+        ha="right",          # usually best for 45°
+        rotation_mode="anchor",
+        fontsize=label_fontsize,
+    )
+    axs[-1].set_xlabel("Step (cell width from supplied widths)")
+
+    axs[0].set_xlim(float(x_edges[0]), float(x_edges[-1]))
+
+    # Event braces on the very top axis (robust, no twiny)
+    if n_steps_hdr and len(axs) > 0:
+        spans = compute_event_spans(steps, n_steps)
+        ax0 = axs[0]
+        y_brace = 1.03
+        h = 0.06
+        for (s, e, ev_name) in spans:
+            x0, x1 = float(x_edges[s]), float(x_edges[e])
+            ev_dur = float(np.sum(dt_s[s:e]))
+            ev_label = f"{ev_name} ({_format_seconds_2sf(ev_dur)})"
+            ax0.plot(
+                [x0, x0, x1, x1],
+                [y_brace, y_brace + h, y_brace + h, y_brace],
+                transform=ax0.get_xaxis_transform(),
+                color="black",
+                lw=0.8,
+                clip_on=False,
+            )
+            ax0.text(
+                0.5 * (x0 + x1), y_brace + h + 0.01, ev_label,
+                transform=ax0.get_xaxis_transform(),
+                ha="left", va="bottom",
+                fontsize=label_fontsize,
+                rotation=45,
+                rotation_mode="anchor",
+                clip_on=False,
+            )
+
+    plt.show()
+    return fig, axs
+
+
+# --- Example call: fast all channels, slow only 0..16 ---
+plot_fast_and_slow_analogue_stacked(
+    V_fast_all=analogue_mats.fast_voltage,
+    R_fast_all=analogue_mats.fast_ramp,
+    channels_fast=fast_analogue,
+    V_slow_all=analogue_mats.slow_voltage,
+    R_slow_all=analogue_mats.slow_ramp,
+    channels_slow=slow_analogue,
+    steps=steps,
+    step_widths=widths,
+    fast_channel_indices=None,                 # all fast channels
+    slow_channel_indices=[0,3,4,5,6,7,11,12,13,14,15],     
+    slow_facecolor="0.96",                     # slightly greyer slow axes
+    label_fontsize=6,
+    line_width=1.5,
+)
+
 
 # %%
 #########
