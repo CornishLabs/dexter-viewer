@@ -13,7 +13,7 @@ import matplotlib.ticker as mticker
 
 plt.close('all')
 # %% Parse file
-xml_path = "example-sequence.xml"
+xml_path = "complicated-example-sequence.xml"
 
 parser = ET.XMLParser(encoding="cp1252")  # try "latin-1" if needed
 tree = ET.parse(xml_path, parser=parser)
